@@ -2,7 +2,7 @@ Bootstrap: docker
 From: python:3.12.9-slim
 
 %files
-    /home/pmata/mepram_data/envtest/requirements.txt /root/requirements.txt
+    '/local/path/to/requirements.txt' /root/requirements.txt
 
 %post
     set -e
