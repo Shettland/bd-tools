@@ -1,0 +1,19 @@
+Bootstrap: docker
+From: python:3.12.9-slim
+
+%files
+    /home/pmata/mepram_data/envtest/requirements.txt /root/requirements.txt
+
+%post
+    set -e
+    apt-get update && apt-get install -y --no-install-recommends gcc g++ && rm -rf /var/lib/apt/lists/*
+
+    pip install --upgrade pip
+    pip install -r /root/requirements.txt
+
+    pip cache purge
+    apt-get purge -y gcc g++ && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+%environment
+    export PATH="/usr/local/bin:$PATH"
+    export PYTHONUNBUFFERED=1
