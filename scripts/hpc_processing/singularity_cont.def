@@ -2,11 +2,11 @@ Bootstrap: docker
 From: python:3.12.9-slim
 
 %files
-    '/local/path/to/requirements.txt' /root/requirements.txt
+    /home/pmata/mepram_data/bd-tools/scripts/hpc_processing/requirements.txt /root/requirements.txt
 
 %post
     set -e
-    apt-get update && apt-get install -y --no-install-recommends gcc g++ && rm -rf /var/lib/apt/lists/*
+    apt-get update && apt-get install -y --no-install-recommends gcc g++ libgomp1 && rm -rf /var/lib/apt/lists/*
 
     pip install --upgrade pip
     pip install -r /root/requirements.txt
