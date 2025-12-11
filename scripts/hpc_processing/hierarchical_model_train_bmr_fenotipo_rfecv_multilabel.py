@@ -743,9 +743,13 @@ def optimise_multilabel_head(
         weight_series = None
 
     Y_array = np.asarray(Y)
+    n_labels = Y_array.shape[1]
 
     def objective(trial: optuna.Trial) -> float:
-        threshold = trial.suggest_float("threshold", 0.01, 0.8)
+        thresholds = np.array([
+            trial.suggest_float(f"thr_{j}", 0.01, 0.8)
+            for j in range(n_labels)
+        ])
         if model_type == "xgb":
             params = {
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
@@ -791,7 +795,7 @@ def optimise_multilabel_head(
             model.fit(X_tr, Y_tr)
 
             y_proba = model.predict_proba(X_va)
-            y_pred = (y_proba >= threshold).astype(int)
+            y_pred = (y_proba >= thresholds[np.newaxis, :]).astype(int)
             score = f1_score(
                 Y_va,
                 y_pred,
@@ -953,30 +957,39 @@ def train_with_feature_subset(
         mlb = MultiLabelBinarizer()
         y_train_pos_bin = mlb.fit_transform(y_train_pos)
 
-        # --- train per-label LGBM + calibration ---
-        multilabel_models, multilabel_calibrators = train_multilabel_head_lgbm(
+        # --- optimise multi-label head (shared threshold) ---
+        best_params, multiclass_study = optimise_multilabel_head(
             X_train_pos,
             y_train_pos_bin,
+            n_splits=args.cv_splits,
+            n_trials=args.multiclass_trials,
+            random_state=args.random_state,
             sample_weight=pos_weights,
+            model_type=args.multiclass_model,
+            threshold=args.multilabel_threshold,
+        )
+        n_labels = len(mlb.classes_)
+
+        # Extract per-label thresholds from best_params; fall back to global default if missing
+        multilabel_thresholds_dict = {}
+        for i, cls in enumerate(list(mlb.classes_)):
+            key = f"thr_{i}"
+            thr_i = float(best_params.pop(key, args.multilabel_threshold))
+            multilabel_thresholds_dict[cls] = thr_i
+        multilabel_thresholds = np.array(
+            [multilabel_thresholds_dict[cls] for cls in mlb.classes_],
+            dtype=float,
+        )
+        base_estimator = build_multilabel_base_estimator(
+            params=best_params,
+            model_type=args.multiclass_model,
             random_state=args.random_state,
         )
+        ovr_model = OneVsRestClassifier(base_estimator, n_jobs=-1)
+        ovr_model.fit(X_train_pos, y_train_pos_bin)
 
-        # --- tune per-label thresholds on training positives ---
-        proba_train_pos = predict_multilabel_proba(
-            multilabel_models,
-            multilabel_calibrators,
-            X_train_pos,
-        )
-        multilabel_thresholds = tune_label_thresholds(
-            y_train_pos_bin,
-            proba_train_pos,
-            n_points=101,
-        )
-
-        # store in variables used later
-        multiclass_model = (multilabel_models, multilabel_calibrators, multilabel_thresholds)
-        multiclass_params = {"per_label_model": "LGBM+Calibrated", "thresholds": multilabel_thresholds}
-        multiclass_study = None  # we no longer use Optuna for multilabel
+        multiclass_model = (ovr_model, multilabel_thresholds)
+        multiclass_params = {"ovr_params": best_params, "threshold": multilabel_thresholds_dict}
 
     else:
         # --- existing multiclass (single-label) branch stays as is ---
@@ -1065,30 +1078,32 @@ def train_with_feature_subset(
         X_test_pos = X_test_multiclass_scaled.iloc[pos_candidates]
 
         if args.multilabel and mlb is not None:
-            # unpack multilabel model triple
-            multilabel_models, multilabel_calibrators, multilabel_thresholds = multiclass_model
-
-            pos_proba = predict_multilabel_proba(
-                multilabel_models,
-                multilabel_calibrators,
-                X_test_pos,
-            )
+            # unpack multilabel model tuple
+            ovr_model, multilabel_thresharray = multiclass_model
+            pos_proba = ovr_model.predict_proba(X_test_pos)
             class_labels = mlb.classes_
 
             # apply per-label thresholds
-            pos_pred_bin = binarize_with_thresholds(pos_proba, multilabel_thresholds)
+            pos_pred_bin = (pos_proba >= multilabel_thresharray[np.newaxis, :]).astype(int)
 
             for local_idx, sample_idx in enumerate(pos_candidates):
                 bin_row = pos_pred_bin[local_idx]
                 selected = class_labels[np.where(bin_row == 1)[0]]
                 hierarchical_pred[sample_idx] = "|".join(selected) if len(selected) else ""
                 hierarchical_conf[sample_idx] = float(pos_proba[local_idx].max()) if pos_proba.shape[1] else 0.0
+                bin_row = pos_pred_bin[local_idx]
+                idx_selected = np.where(bin_row == 1)[0]
+                selected = class_labels[idx_selected]
+                hierarchical_pred[sample_idx] = "|".join(selected) if len(selected) else ""
+                if len(idx_selected):
+                    hierarchical_conf[sample_idx] = float(pos_proba[local_idx, idx_selected].max())
+                else:
+                    hierarchical_conf[sample_idx] = 0.0
                 multiclass_proba_per_sample[sample_idx] = {
                     cls: float(prob) for cls, prob in zip(class_labels, pos_proba[local_idx])
                 }
 
         else:
-            # ORIGINAL multiclass branch (unchanged)
             pos_proba = multiclass_model.predict_proba(X_test_pos)
             pos_pred_idx = np.argmax(pos_proba, axis=1)
             pos_pred_labels = label_encoder.inverse_transform(pos_pred_idx)
@@ -1139,14 +1154,9 @@ def train_with_feature_subset(
             y_test_pos_true_bin = mlb.transform(y_test_pos_true_filtered)
 
             # unpack multilabel model
-            multilabel_models, multilabel_calibrators, multilabel_thresholds = multiclass_model
-
-            pos_true_proba = predict_multilabel_proba(
-                multilabel_models,
-                multilabel_calibrators,
-                X_test_pos_true,
-            )
-            y_pred_bin = binarize_with_thresholds(pos_true_proba, multilabel_thresholds)
+            ovr_model, best_threshold = multiclass_model
+            pos_true_proba = ovr_model.predict_proba(X_test_pos_true)
+            y_pred_bin = (pos_true_proba >= best_threshold).astype(int)
 
             pos_base_weight = test_weights.loc[pos_mask_test] if test_weights is not None else None
 
@@ -1194,7 +1204,7 @@ def train_with_feature_subset(
                 "precision_at_3": float(p3),
                 "recall_at_3": float(r3),
                 "per_label_thresholds": {
-                    cls: float(th) for cls, th in zip(mlb.classes_, multilabel_thresholds)
+                    cls: float(th) for cls, th in zip(mlb.classes_, multilabel_thresharray or [])
                 },
             }
             macro_f1 = multilabel_metrics["micro_f1"]
@@ -1604,6 +1614,7 @@ def run_training(args: argparse.Namespace) -> None:
         json.dumps(aggregate_summary, indent=2)
     )
     print("Completed hierarchical training with RFECV-selected features.")
+    print(f"Results saved in {output_folder}")
 
 
 # ---------------------------------------------------------------------------
