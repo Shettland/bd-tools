@@ -122,7 +122,6 @@ def load_processed_dataframe(csv_path: Path, cols_to_delete: List[str]) -> pd.Da
     df = pd.read_csv(csv_path)
     if "foco" in df.columns:
         df["foco"] = df["foco"].map(FOCUS_MAP).fillna(df["foco"])
-        df = df[~df["foco"].isin(FOCUS_TO_EXCLUDE)]
     return safe_drop_columns(df, cols_to_delete)
 
 

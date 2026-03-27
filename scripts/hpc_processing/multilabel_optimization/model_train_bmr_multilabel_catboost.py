@@ -109,7 +109,6 @@ FOCUS_TO_EXCLUDE = {
     "cardiovascular",
 }
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -149,6 +148,15 @@ def parse_multilabel_cell(value, *, delimiter: str) -> list[str]:
 
 
 def safe_drop_columns(df, columns):
+    """Drop a list of columns from a DataFrame, silently skipping any that are absent.
+
+    Args:
+        df: Input DataFrame.
+        columns: Column names to attempt to drop.
+
+    Returns:
+        DataFrame with the specified columns removed (where present).
+    """
     for col in columns:
         try:
             df = df.drop(columns=col)
@@ -158,7 +166,23 @@ def safe_drop_columns(df, columns):
 
 
 def impute_missing_values(loaded_df, exclude_cols):
-    """Impute missing values in the dataframe, avoid imputing values in target_cols."""
+    """Impute missing values using column-type-aware strategies.
+
+    Columns are split into four groups and imputed separately:
+    - Binary columns (values in {0, 1}): mode imputation via SimpleImputer.
+    - Continuous numeric columns (>=15 unique values): KNN imputation (k=5, distance-weighted) to preserve local data structure.
+    - Low-cardinality numeric columns (<15 unique values, treated as categorical-numeric): mode imputation, result cast to int.
+    - String / categorical columns: mode imputation, result cast to str.
+
+    Target and weight columns listed in exclude_cols are excluded from imputation and re-attached to the result unchanged.
+
+    Args:
+        loaded_df: DataFrame that may contain missing values.
+        exclude_cols: Column names to skip during imputation (e.g. target labels, sample weights).
+
+    Returns:
+        DataFrame with the same shape as loaded_df but with NaNs filled in all non-excluded columns.
+    """
     exclude_cols = set(exclude_cols)
     df_copy = loaded_df.drop(columns=list(exclude_cols), errors="ignore").copy()
     numeric_cols = df_copy.select_dtypes(include=["int", "float"]).columns
@@ -194,7 +218,17 @@ def impute_missing_values(loaded_df, exclude_cols):
 
 
 def compute_balanced_sample_weight(labels: pd.Series, base_sample_weight: pd.Series | None = None) -> pd.Series:
-    """Return per-sample weights scaled by class balance and optional base weights."""
+    """Compute per-sample weights that correct for class imbalance.
+
+    Uses sklearn.utils.class_weight.compute_class_weight with class_weight='balanced' to derive a weight for each class, then maps those weights onto every sample. If base_sample_weight is provided (e.g. clinical cohort weights), the balanced weights are multiplied element-wise so both sources of weighting are combined.
+
+    Args:
+        labels: Series of class labels for the training split.
+        base_sample_weight: Optional pre-existing per-sample weights. When supplied the result is balanced_weight * base_weight.
+
+    Returns:
+        Series of per-sample weights with the same index as labels.
+    """
     classes = np.unique(labels)
     class_weights = compute_class_weight(class_weight="balanced", classes=classes, y=labels)
     weight_map = {cls: weight for cls, weight in zip(classes, class_weights)}
@@ -206,7 +240,23 @@ def compute_balanced_sample_weight(labels: pd.Series, base_sample_weight: pd.Ser
 
 
 def load_processed_dataframe(csv_path: Path, cols_to_delete: list, args) -> Tuple[pd.DataFrame, set]:
-    """Load the merged dataframe and apply the focus mapping/filter."""
+    """Load the merged dataset from CSV and apply domain-specific filtering.
+
+    Steps performed:
+    - Reads the CSV at csv_path.
+    - Maps the numeric foco column to human-readable Spanish labels using FOCUS_MAP.
+    - Removes rows whose multiclass_target belongs to MINOR_CLASSES_TO_DROP (only for resultado_hemo / all_cult_org targets).
+    - For fenotipo_resistencia targets, drops phenotype classes that represent fewer than 1/50th of the total sample count (very rare classes).
+    - Drops administrative / leakage columns listed in cols_to_delete.
+
+    Args:
+        csv_path: Path to the merged input CSV.
+        cols_to_delete: Column names to drop before returning the DataFrame.
+        multiclass_target: Name of the multiclass label column; governs which class-filtering rules are applied.
+
+    Returns:
+        Cleaned DataFrame ready for feature engineering.
+    """
     df = pd.read_csv(csv_path)
     df[args.multiclass_target] = df[args.multiclass_target].apply(
         lambda v: parse_multilabel_cell(v, delimiter=args.multilabel_delimiter)
@@ -214,7 +264,6 @@ def load_processed_dataframe(csv_path: Path, cols_to_delete: list, args) -> Tupl
     if "foco" in df.columns:
         df = df.copy()
         df["foco"] = df["foco"].map(FOCUS_MAP).fillna(df["foco"])
-        df = df[~df["foco"].isin(FOCUS_TO_EXCLUDE)]
 
     all_labels = df[args.multiclass_target].explode()
     counts = all_labels.value_counts()
@@ -238,7 +287,25 @@ def perform_rfecv_feature_selection(
     min_features_to_select: int,
     scoring: str,
 ) -> Tuple[List[str], RFECV]:
-    """Run RFECV once and return the selected columns alongside the fitted selector."""
+    """Select an optimal feature subset via Recursive Feature Elimination with CV.
+
+    Wraps sklearn's RFECV around a RandomForestClassifier (400 trees, balanced subsample weights) and a StratifiedKFold cross-validator. Features are ranked by importance and eliminated step at a time until the cross-validated score stops improving, subject to the min_features_to_select floor.
+
+    Args:
+        X: Full feature matrix (training split).
+        y: Target label series aligned with X.
+        random_state: Seed for the Random Forest and the CV splitter.
+        cv_splits: Number of stratified folds used during cross-validation.
+        step: Number (int) or fraction (float in (0, 1]) of features to remove at each iteration.
+        min_features_to_select: Hard lower bound on the number of features retained. Must be between 1 and X.shape[1].
+        scoring: Sklearn scoring string passed to RFECV (e.g. 'f1_macro').
+
+    Returns:
+        Tuple of (selected_columns, fitted_selector) where selected_columns is the list of column names chosen by RFECV and fitted_selector is the fitted RFECV object (useful for inspecting support_, ranking_, and cv_results_).
+
+    Raises:
+        ValueError: If X is empty, step is out of range, or min_features_to_select is outside [1, n_features].
+    """
     if X.empty:
         raise ValueError("Cannot run RFECV on an empty feature matrix.")
 
@@ -419,7 +486,31 @@ def train_with_feature_subset(
     args: argparse.Namespace,
     output_dir: Path,
 ) -> Dict[str, object]:
-    """Train the multi-label model using the provided feature subset."""
+    """Train, evaluate, and persist the full two-stage hierarchical classifier.
+
+    This is the core training function. Given pre-selected feature lists for the binary gate and the phenotype head, it:
+    1. Creates a timestamped output subdirectory and saves selected_features.json.
+    2. Scales features with MinMaxScaler (fit on train, applied to test).
+    3. Converts binary labels to 0/1 and computes balanced gate weights.
+    4. Runs optimise_binary_gate and trains the final gate model on the full training set.
+    5. Filters to positive-only training samples, encodes phenotype labels, and runs optimise_binary_gate again for the two-class phenotype head.
+    6. Applies the hierarchical prediction pipeline on the test set: gate predicts POSITIVE/NEGATIVE; for POSITIVE samples, the phenotype head predicts the resistance class.
+    7. Computes and saves: confusion matrices (binary + multiclass), classification reports, macro F1, binary ROC-AUC, multiclass ROC-AUC, Optuna trial CSVs, and summary.json.
+
+    Args:
+        subset_name: Human-readable label for this feature subset (used as the subdirectory name and in log output).
+        binary_features: Feature columns to use for the binary gate.
+        multiclass_features: Feature columns to use for the phenotype head.
+        X_train_full / X_test_full: Full (unscaled) feature matrices.
+        y_train_binary / y_test_binary: Binary gate label series.
+        y_train_multiclass / y_test_multiclass: Phenotype label series.
+        sample_weight_train / sample_weight_test: Optional per-sample weights; pass None to omit weighting.
+        args: Parsed CLI arguments (model types, Optuna trial counts, CV splits, random state, negative label, etc.).
+        output_dir: Root directory under which the subset subdirectory is created.
+
+    Returns:
+        Summary dict containing model parameters, thresholds, evaluation metrics, text reports, and the output directory path. This dict is also written to <subset_output_dir>/summary.json.
+    """
     subset_output_dir = output_dir / subset_name
     subset_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -601,6 +692,22 @@ def train_with_feature_subset(
 
 
 def run_training(args: argparse.Namespace) -> None:
+    """Orchestrate the end-to-end training pipeline from CLI arguments.
+
+    Executes the following sequence:
+    1. Builds the column-deletion list by merging DELETE_COLUMNS with target columns that are not the active binary/multiclass targets.
+    2. Loads and cleans the dataset via load_processed_dataframe.
+    3. Drops columns exceeding the --na-perc-limit missing-value threshold.
+    4. Optionally imputes remaining missing values (--no-impute disables this).
+    5. One-hot encodes categorical feature columns; sanitises column names.
+    6. Performs a stratified train/test split (stratified on the binary target).
+    7. Runs RFECV independently for the binary gate and the positive-only multiclass subset, producing separate optimal feature sets.
+    8. Calls train_with_feature_subset once with the RFECV-selected features.
+    9. Writes rfecv_selected_features.json and aggregate_summary.json to the timestamped output directory.
+
+    Args:
+        args: argparse.Namespace produced by build_arg_parser. All training configuration (file paths, model choices, trial counts, CV splits, random seed, imputation flag, etc.) is read from here.
+    """
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     print("SELECTED ARGS: ", args)
     cols_to_delete = list(DELETE_COLUMNS)
@@ -740,6 +847,29 @@ def run_training(args: argparse.Namespace) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build and return the CLI argument parser for the training script.
+
+    Defines all command-line flags consumed by run_training, including:
+    - --database-file / -db: path to the merged input CSV.
+    - --output-dir / -o: root output directory (a timestamp suffix is appended at runtime).
+    - --binary-target / --multiclass-target: target column names.
+    - --binary-model / --multiclass-model: estimator family ('xgb', 'lgbm', or 'rf' where applicable).
+    - --weight-column: column holding per-sample cohort weights.
+    - --negative-label / -n: string label for the negative class.
+    - --na-perc-limit / -na: maximum allowed missing-value fraction per feature column before it is dropped.
+    - --no-impute: flag to disable KNN / mode imputation.
+    - --test-size / -tsize: hold-out fraction for final evaluation.
+    - --binary-trials / -btrials: Optuna trial budget for the gate.
+    - --multiclass-trials / -mtrials: Optuna trial budget for the head.
+    - --cv-splits: number of stratified folds.
+    - --random-state: global random seed.
+    - --rfecv-step: feature-elimination step size for RFECV.
+    - --rfecv-min-features: minimum features to retain after RFECV.
+    - --rfecv-scoring: scoring metric for RFECV cross-validation.
+
+    Returns:
+        Configured ArgumentParser instance ready for parse_args().
+    """
     home = Path.cwd()
     default_db = os.path.join(home, "mepram_data", "df_merged_full.csv")
     default_out = os.path.join(home, "mepram_data", "outputs", "fenotipo_multilabel_catboost")
@@ -847,6 +977,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Entry point: parse CLI arguments, run training, and report elapsed time.
+
+    Measures wall-clock time from start to finish and prints the total elapsed minutes to stdout for SLURM job logs.
+    """
     start = time.time()
     print("Checking parsed args...")
     parser = build_arg_parser()

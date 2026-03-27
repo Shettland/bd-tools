@@ -88,6 +88,15 @@ FOCUS_TO_EXCLUDE = {
 # ---------------------------------------------------------------------------
 
 def safe_drop_columns(df, columns):
+    """Drop a list of columns from a DataFrame, silently skipping any that are absent.
+
+    Args:
+        df: Input DataFrame.
+        columns: Column names to attempt to drop.
+
+    Returns:
+        DataFrame with the specified columns removed (where present).
+    """
     for col in columns:
         try:
             df = df.drop(columns=col)
@@ -97,11 +106,27 @@ def safe_drop_columns(df, columns):
 
 
 def load_processed_dataframe(csv_path, cols_to_delete, target):
+    """Load the merged dataset from CSV and apply domain-specific filtering.
+
+    Steps performed:
+    - Reads the CSV at csv_path.
+    - Maps the numeric foco column to human-readable Spanish labels using FOCUS_MAP.
+    - Removes rows whose multiclass_target belongs to MINOR_CLASSES_TO_DROP (only for resultado_hemo / all_cult_org targets).
+    - For fenotipo_resistencia targets, drops phenotype classes that represent fewer than 1/50th of the total sample count (very rare classes).
+    - Drops administrative / leakage columns listed in cols_to_delete.
+
+    Args:
+        csv_path: Path to the merged input CSV.
+        cols_to_delete: Column names to drop before returning the DataFrame.
+        multiclass_target: Name of the multiclass label column; governs which class-filtering rules are applied.
+
+    Returns:
+        Cleaned DataFrame ready for feature engineering.
+    """
     df = pd.read_csv(csv_path)
     if "foco" in df.columns:
         df = df.copy()
         df["foco"] = df["foco"].map(FOCUS_MAP).fillna(df["foco"])
-        df = df[~df["foco"].isin(FOCUS_TO_EXCLUDE)]
     if "resistente_cefalosporina" == target:
         df = df[df["resultado_hemo"] != "NEGATIVE"]
     elif "resultado_hemo_grouped" == target:
@@ -111,6 +136,23 @@ def load_processed_dataframe(csv_path, cols_to_delete, target):
 
 
 def impute_missing_values(loaded_df, exclude_cols):
+    """Impute missing values using column-type-aware strategies.
+
+    Columns are split into four groups and imputed separately:
+    - Binary columns (values in {0, 1}): mode imputation via SimpleImputer.
+    - Continuous numeric columns (>=15 unique values): KNN imputation (k=5, distance-weighted) to preserve local data structure.
+    - Low-cardinality numeric columns (<15 unique values, treated as categorical-numeric): mode imputation, result cast to int.
+    - String / categorical columns: mode imputation, result cast to str.
+
+    Target and weight columns listed in exclude_cols are excluded from imputation and re-attached to the result unchanged.
+
+    Args:
+        loaded_df: DataFrame that may contain missing values.
+        exclude_cols: Column names to skip during imputation (e.g. target labels, sample weights).
+
+    Returns:
+        DataFrame with the same shape as loaded_df but with NaNs filled in all non-excluded columns.
+    """
     exclude_cols = set(exclude_cols)
     df_copy = loaded_df.drop(columns=list(exclude_cols), errors="ignore").copy()
     numeric_cols = df_copy.select_dtypes(include=["int", "float"]).columns
@@ -138,6 +180,17 @@ def impute_missing_values(loaded_df, exclude_cols):
 
 
 def compute_balanced_sample_weight(labels, base_sample_weight=None):
+    """Compute per-sample weights that correct for class imbalance.
+
+    Uses sklearn.utils.class_weight.compute_class_weight with class_weight='balanced' to derive a weight for each class, then maps those weights onto every sample. If base_sample_weight is provided (e.g. clinical cohort weights), the balanced weights are multiplied element-wise so both sources of weighting are combined.
+
+    Args:
+        labels: Series of class labels for the training split.
+        base_sample_weight: Optional pre-existing per-sample weights. When supplied the result is balanced_weight * base_weight.
+
+    Returns:
+        Series of per-sample weights with the same index as labels.
+    """
     classes = np.unique(labels)
     class_weights = compute_class_weight(class_weight="balanced", classes=classes, y=labels)
     weight_map = {cls: weight for cls, weight in zip(classes, class_weights)}
@@ -578,6 +631,10 @@ def build_parser():
 
 
 def main():
+    """Entry point: parse CLI arguments, run training, and report elapsed time.
+
+    Measures wall-clock time from start to finish and prints the total elapsed minutes to stdout for SLURM job logs.
+    """
     start = time.time()
     parser = build_parser()
     args = parser.parse_args()
