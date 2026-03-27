@@ -4,6 +4,26 @@ Machine learning pipelines for hierarchical clinical outcome prediction (etiolog
 
 ---
 
+## Prediction Goals and Task Type Selection
+
+The three clinical outcomes we want to predict are:
+
+| Outcome | Column examples | Typical task |
+|---|---|---|
+| **Sepsis** | `sepsis` | Binary (sepsis vs no sepsis) |
+| **Etiology** | `bmr_etiologia`, `resultado_hemo`, `resultado_hemo_grouped` | Binary (BMR vs non-BMR) or multiclass (gram+/gram−/fungal/…) |
+| **Resistance** | `resistente_cefalosporina`, `resistente_cefalosporina_multi`, `fenotipo_resistencia` | Binary, multiclass, or **multilabel** |
+
+**Choosing the task type** depends on which target column you pass to the script:
+
+- **Binary** — the target column has exactly two classes (e.g. `resistente_cefalosporina`: `NEGATIVE` vs `RESIST_CEFALOSPORINAS_3a_4a`). Use any script under `binary_optimization/` or the binary level of the cascade scripts.
+- **Multiclass** — the target column has more than two mutually exclusive classes (e.g. `fenotipo_resistencia`: MSSA / MRSA / ESBL / …, or `resultado_hemo_grouped`). Use scripts under `multiclass_optimization/` or the multiclass head of the two-level scripts.
+- **Multilabel** — *resistance only* — a single patient can carry **multiple** resistance phenotypes simultaneously, encoded as a pipe- or comma-delimited string (e.g. `fenotipo_resistencia`: `"ESBL|MRSA"`). Use scripts under `multilabel_optimization/`.
+
+> In practice you often want to test the same biological question in more than one framing — for instance, resistance can be modelled as **multilabel** (`fenotipo_resistencia`) when you care about co-occurring phenotypes, or as **binary** (`resistente_cefalosporina`) when you only need a yes/no answer for a specific antibiotic class. The scripts are parameterised so you can switch framing by changing the `--target` / `--binary-target` / `--multiclass-target` argument without touching the code.
+
+---
+
 ## Directory Structure
 
 ```
@@ -42,6 +62,8 @@ Full two-level hierarchy: binary gate + multiclass head for `fenotipo_resistenci
 python hierarchical_model_train.py \
   --database-file data/merged.csv \
   --output-dir outputs/run_001 \
+  --binary-target bmr_etiologia \        # binary gate: BMR etiology (default)
+  --multiclass-target fenotipo_resistencia \  # multiclass head: resistance phenotype (default)
   --binary-model lgbm \
   --multiclass-model xgb \
   --binary-trials 100 \
@@ -50,7 +72,7 @@ python hierarchical_model_train.py \
 ```
 
 ### `hierarchical_model_train_binary_head.py`
-Variant of the above that prioritises optimising the binary gate. Same interface.
+Variant of the above that prioritises optimising the binary gate. Same interface — accepts `--binary-target` (default: `bmr_etiologia`) and `--multiclass-target` (default: `fenotipo_resistencia`).
 
 ### `hierarchical_model_train_binary_only.py`
 Binary-only classifier (no multiclass head). Supports stacked ensembles (RF + LGBM + XGB → LogisticRegression meta-learner).
@@ -59,19 +81,21 @@ Binary-only classifier (no multiclass head). Supports stacked ensembles (RF + LG
 python hierarchical_model_train_binary_only.py \
   --database-file data/merged.csv \
   --output-dir outputs/binary_run \
+  --binary-target bmr_etiologia \   # default; swap for e.g. resistente_cefalosporina for binary resistance
   --binary-model lgbm
 ```
 
 ### `hierarchical_model_train_rfecv.py`
-Two-level hierarchy targeting `resultado_hemo` (blood culture outcome) with an explicit RFECV history logged to `summary.json`.
+Two-level hierarchy with an explicit RFECV history logged to `summary.json`. Uses `--target` (default: `resultado_hemo`) — pass `--negative-label NEGATIVE` to define the binary negative class.
 
 ### `binary_model_cefalosporina_dropother.py`
-Binary-only classifier specifically for cefalosporin resistance. Automatically drops low-frequency foci and the "other" category before training.
+Binary-only classifier specifically for cefalosporin resistance. Automatically drops low-frequency foci and the "other" category before training. The resistance target (`resistente_cefalosporina`) is hardcoded — the `--binary-target` argument controls the etiology gate (default: `bmr_etiologia`).
 
 ```bash
 python binary_model_cefalosporina_dropother.py \
   --database-file data/merged.csv \
   --output-dir outputs/cef_run \
+  --binary-target bmr_etiologia \   # gate target (default); resistance target is hardcoded
   --binary-model lgbm \
   --binary-trials 150 \
   --weight-column sample_weight
@@ -85,6 +109,7 @@ python feature_reduction_analysis.py \
   --database-file data/merged.csv \
   --reference-model outputs/best_run/rfecv_0/rfecv_selector.pkl \
   --output-dir outputs/feature_sweep \
+  --binary-target resultado_hemo_grouped \   # default; swap for resistente_cefalosporina (binary) etc.
   --feature-counts 5,10,15,20,30,50,75,100 \
   --binary-trials 80
 ```
@@ -107,6 +132,9 @@ Full OOF (out-of-fold) cascade: each level appends its predicted probabilities a
 python hierarchical_cascade_three_level.py \
   --database-file data/merged.csv \
   --output-dir outputs/cascade_run \
+  --sepsis-target sepsis \                      # L1 binary (default)
+  --hemo-target resultado_hemo_grouped \        # L2 multiclass (default)
+  --cef-target resistente_cefalosporina \       # L3 binary (default); swap for multiclass variant
   --binary-trials 100 \
   --cv-splits 5
 ```
@@ -114,7 +142,7 @@ python hierarchical_cascade_three_level.py \
 Outputs: `level1_sepsis/`, `level2_hemo/`, `level3_cef/` subdirs + `aggregate_summary.json`.
 
 ### `hierarchical_cascade_three_level_cefmult.py`
-Variant where Level 3 is **multiclass** (`resistente_cefalosporina_multi`) instead of binary. Same interface.
+Variant where Level 3 is **multiclass** (`resistente_cefalosporina_multi`) instead of binary. Same interface — `--cef-target` defaults to `resistente_cefalosporina_multi`.
 
 ### `hierarchical_cascade_three_level_copytest.py`
 Development/testing copy of the three-level cascade. Not intended for production runs.
@@ -125,7 +153,10 @@ Three-level hierarchy where each level is trained **independently** on the origi
 ```bash
 python hierarchical_independent_three_level.py \
   --database-file data/merged.csv \
-  --output-dir outputs/independent_run
+  --output-dir outputs/independent_run \
+  --sepsis-target sepsis \                 # L1 binary (default)
+  --hemo-target resultado_hemo_grouped \   # L2 multiclass (default)
+  --cef-target resistente_cefalosporina    # L3 binary (default)
 ```
 
 ### `shared_features_analysis.py`
@@ -135,6 +166,9 @@ Same as previous cascade trainings but runs a single joint RFECV across all thre
 python shared_features_analysis.py \
   --database-file data/merged.csv \
   --output-dir outputs/shared_run \
+  --sepsis-target sepsis \                          # L1 binary (default)
+  --hemo-target resultado_hemo_grouped \            # L2 multiclass (default)
+  --cef-target resistente_cefalosporina_multi \     # L3 multiclass/multilabel (default)
   --level-weights 1 1 2   # double weight to Level 3
 ```
 
@@ -151,16 +185,18 @@ Two-level hierarchy (binary gate + multiclass head) where both classifiers are w
 ```bash
 python calibrated_model_2level.py \
   --database-file data/merged.csv \
-  --output-dir outputs/calibrated_run
+  --output-dir outputs/calibrated_run \
+  --binary-target bmr_etiologia    # binary gate default; multiclass head target is hardcoded
 ```
 
 ### `multiclass_rfecv_model_train.py`
-Direct multiclass classifier for `resultado_hemo`-style targets — **no binary gate**. Applies RFECV and SMOTE/ROS for class imbalance. Use when only the multiclass prediction is needed.
+Direct multiclass classifier — **no binary gate**. Applies RFECV and SMOTE/ROS for class imbalance. Use when only the multiclass prediction is needed.
 
 ```bash
 python multiclass_rfecv_model_train.py \
   --database-file data/merged.csv \
-  --output-dir outputs/multiclass_run
+  --output-dir outputs/multiclass_run \
+  --target resultado_hemo    # default; swap for fenotipo_resistencia, resultado_hemo_grouped, etc.
 ```
 
 ---
@@ -176,6 +212,9 @@ Binary gate + multi-label head. Use `--multilabel` to activate multi-label mode;
 python hierarchical_model_train_bmr_fenotipo_rfecv_multilabel.py \
   --database-file data/merged.csv \
   --output-dir outputs/multilabel_run \
+  --binary-target bmr_etiologia \          # binary gate (default)
+  --multiclass-target fenotipo_resistencia \  # multilabel resistance head (default)
+  --negative-label NEGATIVE \
   --multilabel
 ```
 
@@ -186,7 +225,8 @@ Multi-label `fenotipo_resistencia` using CatBoost, which handles categorical fea
 python model_train_bmr_multilabel_catboost.py \
   --database-file data/merged.csv \
   --output-dir outputs/catboost_run \
-  --multiclass-target fenotipo_resistencia
+  --multiclass-target fenotipo_resistencia \   # multilabel resistance target (default)
+  --multilabel-delimiter ","
 ```
 
 ### `model_train_bmr_multilabel_only.py`
@@ -195,7 +235,9 @@ Multi-label classifier with no binary gate — all patients go directly to the m
 ```bash
 python model_train_bmr_multilabel_only.py \
   --database-file data/merged.csv \
-  --output-dir outputs/multilabel_only_run
+  --output-dir outputs/multilabel_only_run \
+  --multiclass-target fenotipo_resistencia \   # multilabel resistance target (default)
+  --multiclass-model lgbm                      # lgbm | catb
 ```
 
 ---
